@@ -22,7 +22,6 @@ register_xpu_ci(est_time=300, suite="stage-a-test-1-gpu-xpu")
 
 
 class TestXPUBasic(CustomTestCase):
-
     def test_basic_generation(self):
         """Server starts on XPU and completes at least one decode step."""
         args = [
@@ -33,7 +32,6 @@ class TestXPUBasic(CustomTestCase):
             "0.6",
             "--batch-size",
             "1",
-            "--disable-decode-cuda-graph",
         ]
         if is_in_ci():
             args += ["--input", "64", "--output", "4"]

@@ -49,18 +49,14 @@ CASE_THRESHOLDS: Dict[str, Dict[ComponentType, float]] = {
     "wan2_2_t2v_a14b_2gpu": {ComponentType.TRANSFORMER: 0.99},
     "wan2_2_t2v_a14b_teacache_2gpu": {ComponentType.TRANSFORMER: 0.99},
     "wan2_2_t2v_a14b_lora_2gpu": {ComponentType.TRANSFORMER: 0.99},
-    "zimage_image_t2i_2_gpus": {ComponentType.TRANSFORMER: 0.9935},
-    "zimage_image_t2i_2_gpus_non_square": {ComponentType.TRANSFORMER: 0.9935},
+    # H100/H200 FlashAttention runs vary between roughly 0.99338 and 0.99350.
+    "zimage_image_t2i_2_gpus": {ComponentType.TRANSFORMER: 0.993},
+    "zimage_image_t2i_2_gpus_non_square": {ComponentType.TRANSFORMER: 0.993},
 }
 
 # Active skip policy. Keep this limited to cases with current, concrete evidence
 # of real divergence or unsupported reference loading in the harness.
 SKIP_COMPONENTS: Dict[str, Dict[ComponentType, ComponentSkip]] = {
-    "flux_image_t2i": {
-        ComponentType.TEXT_ENCODER: ComponentSkip(
-            "Text encoder diverges from HF baseline despite 100% matched weights (CosSim ~0.47)"
-        )
-    },
     "qwen_image_t2i_cache_dit_enabled": {
         ComponentType.VAE: ComponentSkip(
             "Representative VAE accuracy is already covered by qwen_image_t2i for the same source component and topology"
@@ -284,22 +280,6 @@ SKIP_COMPONENTS: Dict[str, Dict[ComponentType, ComponentSkip]] = {
         ComponentType.TEXT_ENCODER: ComponentSkip(
             "Text encoder diverges from HF baseline in 2-GPU accuracy run (CosSim ~0.31) after 100% matched weight transfer"
         ),
-    },
-    "mova_360p_ring1_uly2": {
-        ComponentType.VAE: ComponentSkip(
-            "Representative MOVA VAE accuracy is covered by mova_360p_tp2; ring/ulysses topology does not exercise a distinct VAE component"
-        ),
-        ComponentType.TRANSFORMER: ComponentSkip(
-            "HF reference transformer cannot be materialized from the MOVA video_dit repo layout"
-        ),
-        ComponentType.TEXT_ENCODER: ComponentSkip(
-            "Text encoder diverges from HF baseline in 2-GPU accuracy run (CosSim ~0.31) after 100% matched weight transfer"
-        ),
-    },
-    "flux_image_t2i_2_gpus": {
-        ComponentType.TEXT_ENCODER: ComponentSkip(
-            "Text encoder diverges from HF baseline in 2-GPU accuracy run (CosSim ~0.47) after 100% matched weight transfer"
-        )
     },
     "zimage_image_t2i_2_gpus_non_square": {
         ComponentType.VAE: ComponentSkip(

@@ -9,8 +9,8 @@ from pathlib import Path
 
 import requests
 
+from sglang.srt.hf_transformers import get_tokenizer
 from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.hf_transformers import get_tokenizer
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -39,9 +39,7 @@ class TestEncoderAttention(CustomTestCase):
             "xpu",
             "--mm-attention-backend",
             "xpu_attn",
-            "--disable-decode-cuda-graph",
         ]
-        os.environ["SGLANG_USE_SGL_XPU"] = "1"
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -128,9 +126,7 @@ class TestEncoderAttention_Triton(TestEncoderAttention):
             "xpu",
             "--mm-attention-backend",
             "triton_attn",
-            "--disable-decode-cuda-graph",
         ]
-        os.environ["SGLANG_USE_SGL_XPU"] = "0"
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,

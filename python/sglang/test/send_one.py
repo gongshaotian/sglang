@@ -20,6 +20,8 @@ import tabulate
 from sglang.profiler import run_profile
 from sglang.srt.utils.network import resolve_base_url
 
+JSON_OBJECT_SCHEMA = json.dumps({"type": "object"})
+
 
 @dataclasses.dataclass
 class BenchArgs:
@@ -37,9 +39,7 @@ class BenchArgs:
     presence_penalty: float = 0.0
     json: bool = False
     return_logprob: bool = False
-    prompt: str = (
-        "Human: Give me a fully functional FastAPI server. Show the python code.\n\nAssistant:"
-    )
+    prompt: str = "Human: Give me a fully functional FastAPI server. Show the python code.\n\nAssistant:"
     image: bool = False
     many_images: bool = False
     stop: Optional[list] = None
@@ -48,6 +48,7 @@ class BenchArgs:
     profile_steps: int = 5
     profile_by_stage: bool = False
     profile_prefix: Optional[str] = None
+    admin_api_key: Optional[str] = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -106,6 +107,12 @@ class BenchArgs:
         parser.add_argument(
             "--profile-prefix", type=str, default=BenchArgs.profile_prefix
         )
+        parser.add_argument(
+            "--admin-api-key",
+            type=str,
+            default=BenchArgs.admin_api_key,
+            help="The server's --admin-api-key, which --profile requires (default: SGLANG_ADMIN_API_KEY).",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -142,7 +149,7 @@ def send_one_prompt(
         else:
             if args.different_prompts:
                 prompt = [
-                    f"Test case {i+1}: " + args.prompt for i in range(args.batch_size)
+                    f"Test case {i + 1}: " + args.prompt for i in range(args.batch_size)
                 ]
             else:
                 prompt = [args.prompt] * args.batch_size
@@ -176,7 +183,7 @@ def send_one_prompt(
             "Give me 3 trivial information about that city. "
             "Write in a format of json.\nAssistant:"
         )
-        json_schema = "$$ANY$$"
+        json_schema = JSON_OBJECT_SCHEMA
     else:
         json_schema = None
 
@@ -205,6 +212,7 @@ def send_one_prompt(
             activities=["CPU", "GPU"],
             profile_by_stage=args.profile_by_stage,
             profile_prefix=args.profile_prefix,
+            admin_api_key=args.admin_api_key,
         )
 
     # Send the request

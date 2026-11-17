@@ -15,19 +15,16 @@ from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     PhaseConfig,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import set_global_server_args_for_scheduler
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-from ..mock_server_args import make_mock_server_args
-
-# Unit tests run without distributed initialization. Backends that size buffers by
-# attention tensor-parallel degree should see the single-rank default.
-_parallel_override = get_parallel().override(attn_tp_size=1)
+# Use single-rank attention without distributed initialization.
+_parallel_override = get_parallel().override(attn_tp_size=1, attn_dcp_rank=0)
 _parallel_override.__enter__()
 
 DEFAULT_HEAD_DIM = 16
@@ -65,7 +62,7 @@ def _swa_decode_uses_min_seq_len_rule(case: "DenseAttentionCase") -> bool:
     raise ValueError(
         f"Unknown SWA decode rule for backend {case.backend!r}. Add it to "
         f"either `_SWA_DECODE_MIN_SEQ_LEN_WINDOW` or `_SWA_DECODE_EXTEND_WINDOW` "
-        f"in common/attention_methods/dense_attention.py, depending on what its "
+        f"in attention_methods/dense_attention.py, depending on what its "
         f"`init_forward_metadata_decode` metadata builder produces."
     )
 
@@ -276,6 +273,7 @@ class TinyModelConfig:
         self.swa_v_head_dim = head_dim
         self.is_encoder_decoder = False
         self.is_multimodal = False
+        self.model_is_mrope = False
         self.is_generation = True
         self.quantization = None
         self.is_hybrid_swa = sliding_window_size is not None
@@ -289,15 +287,21 @@ class TinyModelConfig:
             num_key_value_heads=num_kv_heads,
             head_dim=head_dim,
         )
+        self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
+        self.linear_attn_registry_result = None
 
     def get_num_attention_heads(self, tp_size: int) -> int:
         assert self.num_attention_heads % tp_size == 0
         return self.num_attention_heads // tp_size
 
-    def get_num_kv_heads(self, tp_size: int) -> int:
-        assert self.num_key_value_heads % tp_size == 0
-        return self.num_key_value_heads // tp_size
+    def get_max_num_attention_heads(self) -> int:
+        return self.num_attention_heads
+
+    def get_num_kv_heads(self, tp_size: int, dcp_size: int = 1) -> int:
+        kv_tp_size = tp_size // dcp_size
+        assert self.num_key_value_heads % kv_tp_size == 0
+        return self.num_key_value_heads // kv_tp_size
 
 
 class MockModelRunner(ModelRunner):
@@ -318,14 +322,21 @@ class MockModelRunner(ModelRunner):
         self.device = device
         self.dtype = dtype
         self.kv_cache_dtype = dtype
+        self.kv_cache_dtype_str = "auto"
+        # This runner's own resolved backends (production stamps these in
+        # ModelRunner.initialize); a draft runner would carry its own.
+        self.prefill_attention_backend_str = case.backend
+        self.decode_attention_backend_str = case.backend
+        self.draft_attention_backend = None
         self.gpu_id = 0
         self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
-        self.tp_size = 1
-        self.dp_size = 1
-        self.pp_size = 1
         self.is_draft_worker = False
+        self.max_running_requests = pool_batch_size
+        # trtllm_mha __init__ scans model.modules() for ENCODER_ONLY layers;
+        # this dense mock declares none.
+        self.model = nn.Module()
         self.spec_algorithm = SpeculativeAlgorithm.NONE
         # The runner lifecycle warms up kernels in capture() / first execute()
         # via BaseRunner.warmup(); this mock never calls init_backends and has no
@@ -338,7 +349,7 @@ class MockModelRunner(ModelRunner):
             or case.forward_mode.is_draft_extend_v2()
             else 0
         )
-        self.server_args = make_mock_server_args(
+        self._server_args_override = get_context().override_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
             cuda_graph_config=CudaGraphConfig(
@@ -357,13 +368,11 @@ class MockModelRunner(ModelRunner):
             dllm_algorithm=None,
             dllm_algorithm_config=None,
             dp_size=1,
-            enable_dp_attention=False,
             enable_deterministic_inference=False,
             enable_mis=False,
             is_embedding=False,
             kv_cache_dtype="auto",
             max_running_requests=None,
-            model_path=None,
             pp_size=1,
             revision=None,
             speculative_algorithm=None,
@@ -374,7 +383,7 @@ class MockModelRunner(ModelRunner):
             triton_attention_num_kv_splits=8,
             triton_attention_split_tile_size=None,
         )
-        set_global_server_args_for_scheduler(self.server_args)
+        self.server_args = self._server_args_override.install()
         self.req_to_token_pool = ReqToTokenPool(
             size=pool_batch_size,
             max_context_len=max_context_len,
@@ -393,11 +402,15 @@ class MockModelRunner(ModelRunner):
             enable_memory_saver=False,
             enable_alt_stream=False,
         )
+        # A static allocator: ids index the pools as they are.
         self.token_to_kv_pool_allocator = SimpleNamespace(
             page_size=case.page_size,
             get_kvcache=lambda: self.token_to_kv_pool,
+            hands_out_virtual_ids=False,
+            state_id_spaces=lambda: {},
+            request_id_spaces=lambda: {},
         )
-        self.attn_cp_size = 1
+        self.init_runner_ids()
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
         self.init_new_workspace = False
@@ -753,6 +766,8 @@ def _make_forward_batch(
         seq_lens_sum=sum(seq_lens),
         positions=torch.tensor(positions, dtype=torch.int64, device=device),
     )
+    # Production batches take their KV ids from a plan (`init_new`).
+    runner.runner_ids.bind_own_plan(batch)
 
     if case.forward_mode.is_extend(include_draft_extend_v2=True):
         batch.extend_prefix_lens = torch.tensor(
@@ -961,15 +976,18 @@ def build_dense_attention_fixture(
     disable_piecewise_cuda_graph: bool = True,
     runner_batch_size: int | None = None,
     loc_layout: str = "shuffled_pages",
+    model_head_dim: int | None = None,
 ) -> DenseAttentionFixture:
     seed = 2026 + len(case.name) + case.num_kv_heads
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+    # A hybrid model (Gemma-4: 256-wide SWA layers, 512-wide global layers)
+    # declares its widest head model-wide; the layer under test may be narrower.
     model_config = TinyModelConfig(
         num_heads=case.num_heads,
         num_kv_heads=case.num_kv_heads,
-        head_dim=head_dim,
+        head_dim=model_head_dim or head_dim,
         hidden_size=hidden_size,
         context_len=max_context_len,
         sliding_window_size=case.sliding_window_size,
@@ -1262,6 +1280,7 @@ def run_dense_attention_case(
     dtype: torch.dtype = DEFAULT_DTYPE,
     device: str = DEFAULT_DEVICE,
     loc_layout: str = "shuffled_pages",
+    model_head_dim: int | None = None,
 ):
     fixture = build_dense_attention_fixture(
         testcase,
@@ -1272,6 +1291,7 @@ def run_dense_attention_case(
         dtype=dtype,
         device=device,
         loc_layout=loc_layout,
+        model_head_dim=model_head_dim,
     )
     actual = run_dense_fixture_eager(fixture)
     expected = expected_dense_fixture_output(fixture)

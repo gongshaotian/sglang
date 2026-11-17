@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import signal
 import socket
 import subprocess
 import threading
@@ -13,6 +14,11 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_gsm8k
+from sglang.test.server_fixtures.disaggregation_fixture import (
+    SGL_ROUTER_REQUEST_TIMEOUT_SECS,
+    find_sgl_router_binary,
+    sgl_router_command,
+)
 from sglang.test.test_utils import CustomTestCase, popen_launch_server
 
 logging.basicConfig(
@@ -24,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 NAMESPACE = os.environ.get("NAMESPACE")
 CONFIGMAP_NAME = os.environ.get("KUBE_CONFIG_MAP")
+ACTIVE_TEST_CLASS = "active-test-class"
 
 LOCAL_TIMEOUT = 3600
 ALL_ROLE_SET = {"prefill", "decode", "router", "master", "worker"}
@@ -40,7 +47,9 @@ BOOTSTRAP_INIT_PORT = 8995
 
 # Timeouts and delays
 ROUTER_CONFIGMAP_TIMEOUT = 300
+PD_WORKER_READY_TIMEOUT = 600
 SERVER_INITIALIZATION_DELAY = 30
+SERVICE_EXIT_WAIT_SECONDS = 120
 
 
 def get_nic_name():
@@ -190,6 +199,65 @@ def query_configmap(name, namespace):
         return None
 
 
+def upsert_configmap_field_strict(
+    name: str,
+    namespace: str,
+    key: str,
+    value: str,
+):
+    """
+    Add or update a field in ConfigMap using patch.
+    Strict mode: fail if ConfigMap does not exist.
+    """
+    from kubernetes.client.rest import ApiException
+
+    k8s_api = get_k8s_api()
+    patch = {"data": {key: value}}
+
+    try:
+        k8s_api.patch_namespaced_config_map(name=name, namespace=namespace, body=patch)
+        logger.info(f"Upserted ConfigMap {name}: {key}={value}")
+    except ApiException as e:
+        if e.status == 404:
+            raise RuntimeError(
+                f"ConfigMap {name} does not exist in namespace {namespace}"
+            )
+        logger.error(f"Failed to upsert ConfigMap {name}: {e}")
+        raise
+
+
+def wait_for_prefill_decode_exit(
+    key: str,
+    value: str,
+    timeout: int = ROUTER_CONFIGMAP_TIMEOUT,
+    poll_interval: int = 15,
+):
+    start_time = time.time()
+
+    while time.time() - start_time < timeout:
+        configmap = query_configmap(CONFIGMAP_NAME, NAMESPACE)
+        if not configmap or not configmap.data:
+            logger.info(f"ConfigMap data is not available yet, waiting for 15s...")
+            time.sleep(poll_interval)
+            continue
+
+        existing_value = configmap.data.get(key)
+
+        upsert_configmap_field_strict(CONFIGMAP_NAME, NAMESPACE, key, value)
+
+        if existing_value is not None:
+            logger.info(
+                "%s already set (%s), waiting 120s for prefill/decode to exit ...",
+                key,
+                existing_value,
+            )
+            time.sleep(SERVICE_EXIT_WAIT_SECONDS)
+        else:
+            logger.info("%s set for the first time (%s)", key, value)
+
+        return
+
+
 # Get node count from Kubernetes
 def discover_worker_nodes():
     """Discover worker nodes from Kubernetes.
@@ -321,11 +389,101 @@ def wait_for_all_ports_ready(ips, port, timeout=LOCAL_TIMEOUT, check_interval=15
     return False
 
 
-def _get_nnodes_from_args(args_list):
+def wait_for_pd_worker_roles(
+    expected_roles, port, timeout=PD_WORKER_READY_TIMEOUT, check_interval=5
+):
+    """Wait until every PD worker's `/server_info` reports its own role.
+
+    sgl-router classifies a worker as prefill/decode by introspecting
+    `/server_info` once when it starts, and static worker URLs are never
+    re-introspected. A worker that still accepts TCP but is too busy to answer
+    HTTP for a few seconds therefore stays registered as `Plain`, and the
+    decode side then rejects every request with "Disaggregated request
+    received without bootstrap room id". Waiting for the role here removes
+    that race before the router is launched.
+
+    Args:
+        expected_roles (dict): {pod_ip: "prefill" | "decode"}.
+        port (int): Worker HTTP port.
+        timeout (int): Total timeout in seconds.
+        check_interval (int): Interval between checks in seconds.
+
+    Raises:
+        RuntimeError: If a worker never reports the expected role.
+    """
+    start_time = time.time()
+    pending = dict(expected_roles)
+    last_seen = {}
+
+    while time.time() - start_time < timeout:
+        for ip, role in list(pending.items()):
+            url = f"http://{ip}:{port}/server_info"
+            try:
+                response = requests.get(url, timeout=10)
+                response.raise_for_status()
+                info = response.json()
+            except Exception as e:
+                last_seen[ip] = f"request failed: {e}"
+                continue
+
+            mode = info.get("disaggregation_mode")
+            bootstrap_port = info.get("disaggregation_bootstrap_port")
+            last_seen[ip] = f"disaggregation_mode={mode!r}"
+            if mode != role:
+                continue
+            if mode == "prefill" and not bootstrap_port:
+                last_seen[ip] += " (bootstrap port missing)"
+                continue
+            del pending[ip]
+            logger.info(
+                f"Worker {url} reports disaggregation_mode={mode} "
+                f"bootstrap_port={bootstrap_port}"
+            )
+
+        if not pending:
+            logger.info(f"All {len(expected_roles)} PD workers report their role")
+            return
+
+        time.sleep(check_interval)
+
+    raise RuntimeError(
+        f"PD workers did not report their disaggregation role within {timeout}s: "
+        f"{ {ip: last_seen.get(ip, 'no response') for ip in pending} }"
+    )
+
+
+def _get_arg_value(args_list, name):
     for i, arg in enumerate(args_list):
-        if arg == "--nnodes" and i + 1 < len(args_list):
-            return int(args_list[i + 1])
+        # Args are not always strings: launcher-injected values (ports,
+        # sizes) are ints and must not be probed for a "--key=value" prefix.
+        if not isinstance(arg, str):
+            continue
+        if arg == name and i + 1 < len(args_list):
+            return args_list[i + 1]
+        # Also accept the --key=value form.
+        if arg.startswith(f"{name}="):
+            return arg[len(name) + 1 :]
     return None
+
+
+def _get_nnodes_from_args(args_list):
+    nnodes = _get_arg_value(args_list, "--nnodes")
+    return int(nnodes) if nnodes is not None else None
+
+
+def _is_instance_head(pod_index, is_multi_node_instance, nnodes):
+    if not is_multi_node_instance:
+        return True
+    if nnodes is not None and nnodes >= 1:
+        return pod_index % nnodes == 0
+    return pod_index == 0
+
+
+def _get_served_model_name(model_config):
+    args = model_config["prefill_args"]
+    if "--served-model-name" in args:
+        return str(args[args.index("--served-model-name") + 1])
+    return model_config["model_path"]
 
 
 def _get_pod_ip_by_keyword(configmap_data, keyword):
@@ -365,7 +523,12 @@ def check_role(allowed_roles: Union[str, Iterable[str]]):
 def launch_pd_mix_node(model_config):
     logger.info(f"Launch pd mix node start ......")
     host_name = get_host_name()
-    pod_index = int(host_name.rsplit("-", 1)[-1])
+    last_part = host_name.rsplit("-", 1)[-1]
+    if not last_part.isdigit():
+        raise RuntimeError(
+            f"Unexpected hostname format, expected numeric suffix: {host_name}"
+        )
+    pod_index = int(last_part)
 
     # Monitor ConfigMap to generate dist-init-addr and node-rank
     is_ready = False
@@ -436,7 +599,12 @@ def launch_pd_mix_node(model_config):
 def launch_pd_separation_node(model_config):
     logger.info(f"Launch pd separation node start ......")
     host_name = get_host_name()
-    pod_index = int(host_name.rsplit("-", 1)[-1])
+    last_part = host_name.rsplit("-", 1)[-1]
+    if not last_part.isdigit():
+        raise RuntimeError(
+            f"Unexpected hostname format, expected numeric suffix: {host_name}"
+        )
+    pod_index = int(last_part)
     role = "prefill" if "prefill" in host_name else "decode"
 
     bootstrap_init_port = BOOTSTRAP_INIT_PORT
@@ -482,9 +650,23 @@ def launch_pd_separation_node(model_config):
     # Generate prefill/decode run command
     service_args = list()
 
-    mf_addr = f"tcp://{master_prefill_ip}:24666"
-    os.environ["ASCEND_MF_STORE_URL"] = mf_addr
-    logger.info(f"Setting ENV_VAR ASCEND_MF_STORE_URL={mf_addr}")
+    # ASCEND_MF_STORE_URL belongs to the Ascend memfabric transfer path. Other
+    # backends (e.g. mooncake with TENT) configure their metadata through their
+    # own config (MC_TENT_CONF), so the legacy store URL must not leak into the
+    # launched process.
+    role_args = (
+        model_config["prefill_args"]
+        if role == "prefill"
+        else model_config["decode_args"]
+    )
+    transfer_backend = _get_arg_value(role_args, "--disaggregation-transfer-backend")
+    if transfer_backend in (None, "ascend"):
+        mf_addr = f"tcp://{master_prefill_ip}:24666"
+        os.environ["ASCEND_MF_STORE_URL"] = mf_addr
+        logger.info(f"Setting ENV_VAR ASCEND_MF_STORE_URL={mf_addr}")
+    else:
+        os.environ.pop("ASCEND_MF_STORE_URL", None)
+        logger.info(f"Skip ASCEND_MF_STORE_URL for transfer backend {transfer_backend}")
 
     if role == "prefill":
         # Current node is prefill
@@ -616,31 +798,22 @@ def launch_pd_separation_node(model_config):
 
 
 # Launch router node
-def launch_router(model_config):
+def launch_router(model_config, router_binary, process_holder=None):
     logger.info(f"launch_router start ......")
     discover_worker_nodes()
 
     # Monitor to generate prefill/decode URL
     prefill_url = []
     decode_url = []
-    bootstrap_ports = []
     node_ip_list = []
-    is_multi_node_prefill_instance = "--node-rank" not in model_config["prefill_args"]
-    is_multi_node_decode_instance = "--node-rank" not in model_config["decode_args"]
-
-    prefill_nnodes = (
-        _get_nnodes_from_args(model_config["prefill_args"])
-        if is_multi_node_prefill_instance
-        else None
-    )
-    decode_nnodes = (
-        _get_nnodes_from_args(model_config["decode_args"])
-        if is_multi_node_decode_instance
-        else None
-    )
+    roles = []
+    for role, urls in (("prefill", prefill_url), ("decode", decode_url)):
+        args = model_config[f"{role}_args"]
+        is_multi_node_instance = "--node-rank" not in args
+        nnodes = _get_nnodes_from_args(args) if is_multi_node_instance else None
+        roles.append((role, urls, is_multi_node_instance, nnodes))
 
     is_ready = False
-    bootstrap_init_port = BOOTSTRAP_INIT_PORT
     start_time = time.time()
     while not is_ready and time.time() - start_time < ROUTER_CONFIGMAP_TIMEOUT:
         configmap = query_configmap(CONFIGMAP_NAME, NAMESPACE)
@@ -652,50 +825,23 @@ def launch_router(model_config):
 
         prefill_url.clear()
         decode_url.clear()
-        bootstrap_ports.clear()
         node_ip_list.clear()
 
         for pod_name, pod_ip in configmap.data.items():
-            pod_index = int(pod_name.rsplit("-", 1)[-1])
+            # Skip unexpected entries that don't end with a numeric index
+            last_part = pod_name.rsplit("-", 1)[-1]
+            if not last_part.isdigit():
+                logger.info(
+                    "Skipping ConfigMap entry with non-numeric suffix: %s", pod_name
+                )
+                continue
+            pod_index = int(last_part)
 
-            if "prefill" in pod_name:
-                if is_multi_node_prefill_instance:
-                    if prefill_nnodes is not None and prefill_nnodes > 1:
-                        if pod_index % prefill_nnodes == 0:
-                            prefill_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                            bootstrap_ports.append(
-                                str(bootstrap_init_port + pod_index // prefill_nnodes)
-                            )
-                            node_ip_list.append(pod_ip)
-                    elif prefill_nnodes is not None and prefill_nnodes == 1:
-                        prefill_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                        bootstrap_ports.append(str(bootstrap_init_port + pod_index))
-                        node_ip_list.append(pod_ip)
-                    else:
-                        if pod_index == 0:
-                            prefill_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                            bootstrap_ports.append(str(bootstrap_init_port))
-                            node_ip_list.append(pod_ip)
-                else:
-                    prefill_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                    bootstrap_ports.append(str(bootstrap_init_port + pod_index))
-                    node_ip_list.append(pod_ip)
-
-            if "decode" in pod_name:
-                if is_multi_node_decode_instance:
-                    if decode_nnodes is not None and decode_nnodes > 1:
-                        if pod_index % decode_nnodes == 0:
-                            decode_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                            node_ip_list.append(pod_ip)
-                    elif decode_nnodes is not None and decode_nnodes == 1:
-                        decode_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                        node_ip_list.append(pod_ip)
-                    else:
-                        if pod_index == 0:
-                            decode_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
-                            node_ip_list.append(pod_ip)
-                else:
-                    decode_url.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
+            for role, urls, is_multi_node_instance, nnodes in roles:
+                if role in pod_name and _is_instance_head(
+                    pod_index, is_multi_node_instance, nnodes
+                ):
+                    urls.append(f"{pod_ip}:{PREFILL_DECODE_PORT}")
                     node_ip_list.append(pod_ip)
 
         if prefill_url and decode_url:
@@ -710,7 +856,7 @@ def launch_router(model_config):
         )
     logger.info(
         f"ConfigMap monitoring complete: prefill_url={prefill_url}, decode_url={decode_url}, "
-        f"bootstrap_ports={bootstrap_ports}, node_ip_list={node_ip_list}"
+        f"node_ip_list={node_ip_list}"
     )
 
     # Check all node port ready
@@ -719,48 +865,77 @@ def launch_router(model_config):
     ):
         raise RuntimeError("Failed to wait for all nodes to be ready")
 
+    # PD separation only: the router reads each worker's role from
+    # /server_info exactly once when it starts, so wait for the roles first.
+    # An open TCP port is not enough — a worker that is still warming up keeps
+    # accepting connections while it cannot answer HTTP yet, and the router
+    # would then register it as Plain and route PD requests to decode without
+    # a bootstrap room id.
+    if "prefill_args" in model_config and "decode_args" in model_config:
+        expected_roles = {}
+        for role, urls in (("prefill", prefill_url), ("decode", decode_url)):
+            for url in urls:
+                expected_roles[url.rsplit(":", 1)[0]] = role
+        wait_for_pd_worker_roles(expected_roles, port=PREFILL_DECODE_PORT)
+
     # Set environment variables
     set_environment_variables(model_config.get("router_envs"))
 
-    router_args = model_config["router_args"]
-    # Router server params
-    router_command = [
-        "python3",
-        "-u",
-        "-m",
-        "sglang_router.launch_router",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        str(SERVICE_PORT),
-        "--pd-disaggregation",
-        "--policy",
-        "cache_aware",
-        *[str(x) for x in router_args],
-    ]
-
-    for index, url in enumerate(prefill_url):
-        router_command.extend(
-            ["--prefill", f"http://{url}", f"{bootstrap_ports[index]}"]
-        )
-
-    for url in decode_url:
-        router_command.extend(["--decode", f"http://{url}"])
+    router_args = [str(x) for x in model_config["router_args"]]
+    request_timeout_secs = SGL_ROUTER_REQUEST_TIMEOUT_SECS
+    if "--request-timeout-secs" in router_args:
+        i = router_args.index("--request-timeout-secs")
+        request_timeout_secs = router_args[i + 1]
+        del router_args[i : i + 2]
+    router_command = sgl_router_command(
+        router_binary,
+        _get_served_model_name(model_config),
+        [f"http://{url}" for url in prefill_url + decode_url],
+        host="0.0.0.0",
+        port=SERVICE_PORT,
+        request_timeout_secs=request_timeout_secs,
+        extra_args=router_args,
+    )
 
     logger.info(f"Starting router with command: {' '.join(router_command)}")
     try:
         router_process = subprocess.Popen(router_command)
         logger.info(f"Router process started with PID: {router_process.pid}")
+        if process_holder is not None:
+            process_holder.append(router_process)
     except Exception as e:
         raise RuntimeError(f"Failed to start router process: {e}")
 
 
-def wait_server_ready(url, timeout=LOCAL_TIMEOUT):
+def start_router_thread(model_config, base_url):
+    logger.info(f"Starting router in thread...")
+    # Looked up here so a missing binary fails the test, not the daemon thread.
+    router_binary = find_sgl_router_binary()
+    # Filled by launch_router so the readiness wait can fail fast if the router
+    # exits early (e.g. rejected arguments) instead of polling until timeout.
+    process_holder = []
+    router_thread = threading.Thread(
+        target=launch_router, args=(model_config, router_binary, process_holder)
+    )
+    router_thread.daemon = True
+    router_thread.start()
+
+    # /health answers once the router listens; /readiness waits for the
+    # prefill and decode workers to be registered.
+    health_check_url = f"{base_url}/readiness"
+    logger.info(f"Waiting for router to be ready at {health_check_url}")
+    wait_server_ready(health_check_url, process_holder=process_holder)
+    return router_thread
+
+
+def wait_server_ready(url, timeout=LOCAL_TIMEOUT, process_holder=None):
     """Wait for the server to be ready.
 
     Args:
         url (str): Server URL to check.
         timeout (int): Timeout in seconds.
+        process_holder (list): Optional single-element list holding the router
+            subprocess, so an early exit fails fast instead of polling.
 
     Raises:
         RuntimeError: If server fails to start within timeout.
@@ -770,6 +945,11 @@ def wait_server_ready(url, timeout=LOCAL_TIMEOUT):
     check_interval = 10
 
     while True:
+        if process_holder and process_holder[0].poll() is not None:
+            raise RuntimeError(
+                f"Router exited with code {process_holder[0].returncode} before "
+                f"serving {url}; check the router output above for the reason"
+            )
         try:
             response = requests.get(url, timeout=30)
             if response.status_code == 200:
@@ -883,7 +1063,7 @@ class TestNpuMultiNodePdMixTestCaseBase(CustomTestCase):
             num_questions=num_questions,
             max_new_tokens=max_new_tokens,
             parallel=parallel,
-            host=f"http://{self.host}",
+            host=self.host,
             port=self.port,
         )
         logger.info("Starting gsm8k test...")
@@ -891,7 +1071,7 @@ class TestNpuMultiNodePdMixTestCaseBase(CustomTestCase):
         self.assertGreaterEqual(
             metrics["accuracy"],
             expect_accuracy,
-            f'Accuracy is {str(metrics["accuracy"])}, is lower than {expect_accuracy}',
+            f"Accuracy is {str(metrics['accuracy'])}, is lower than {expect_accuracy}",
         )
 
 
@@ -909,7 +1089,9 @@ class TestNpuMultiNodePdSepTestCaseBase(CustomTestCase):
         cls.role = (
             "router"
             if "router" in cls.hostname
-            else "prefill" if "prefill" in cls.hostname else "decode"
+            else "prefill"
+            if "prefill" in cls.hostname
+            else "decode"
         )
         logger.info(f"Init {cls.host} {cls.role=}!")
         cls.sglang_thread = None
@@ -926,16 +1108,7 @@ class TestNpuMultiNodePdSepTestCaseBase(CustomTestCase):
     @classmethod
     @check_role(allowed_roles=["router"])
     def start_router_server(cls):
-        logger.info(f"Starting router in thread...")
-        cls.sglang_thread = threading.Thread(
-            target=launch_router, args=(cls.model_config,)
-        )
-        cls.sglang_thread.daemon = True
-        cls.sglang_thread.start()
-
-        health_check_url = f"{cls.base_url}/health"
-        logger.info(f"Waiting for router to be ready at {health_check_url}")
-        wait_server_ready(health_check_url)
+        cls.sglang_thread = start_router_thread(cls.model_config, cls.base_url)
 
         logger.info(
             f"Waiting {SERVER_INITIALIZATION_DELAY} seconds for the server to fully initialize..."
@@ -991,7 +1164,7 @@ class TestNpuMultiNodePdSepTestCaseBase(CustomTestCase):
             num_questions=num_questions,
             max_new_tokens=max_new_tokens,
             parallel=parallel,
-            host=f"http://{self.host}",
+            host=self.host,
             port=self.port,
         )
         logger.info("Starting gsm8k test...")
@@ -999,5 +1172,24 @@ class TestNpuMultiNodePdSepTestCaseBase(CustomTestCase):
         self.assertGreaterEqual(
             metrics["accuracy"],
             expect_accuracy,
-            f'Accuracy is {str(metrics["accuracy"])}, is lower than {expect_accuracy}',
+            f"Accuracy is {str(metrics['accuracy'])}, is lower than {expect_accuracy}",
         )
+
+
+def kill_process_group(process):
+    """SIGKILL the whole process group led by ``process.pid`` (== pgid).
+
+    ``process`` is a ``subprocess.Popen`` launched with ``start_new_session=True``,
+    so its pid equals the process-group id. A ``None`` process is ignored.
+    """
+    if process is None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+        logger.info(f"killed process group pgid={process.pid}")
+    except ProcessLookupError:
+        logger.info(f"process group pgid={process.pid} already gone")
+    except PermissionError:
+        logger.warning(f"no permission to kill process group pgid={process.pid}")
+    except OSError as e:
+        logger.warning(f"failed to kill process group pgid={process.pid}: {e}")

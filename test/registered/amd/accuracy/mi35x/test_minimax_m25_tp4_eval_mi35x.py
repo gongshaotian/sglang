@@ -30,6 +30,7 @@ register_amd_ci(
     est_time=5400,
     suite="nightly-amd-4-gpu-mi35x-minimax-m25-tp4",
     nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 INVALID = -9999999
@@ -188,9 +189,9 @@ class TestMiniMaxM25TP4EvalMI35x(unittest.TestCase):
         for config in self.models:
             display_name = config.get_display_name()
             with self.subTest(model=display_name):
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 print(f"Testing: {display_name}")
-                print(f"{'='*60}")
+                print(f"{'=' * 60}")
 
                 env = os.environ.copy()
                 for key, value in config.env_vars.items():
